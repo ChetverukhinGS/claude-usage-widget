@@ -3,6 +3,10 @@
 # Shown only while a Claude desktop window is open. Drag to move, right-click to close.
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+Add-Type -Namespace ClaudeWidget -Name Native -MemberDefinition @'
+[DllImport("user32.dll")]
+public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+'@
 
 $dataFile  = Join-Path $env:USERPROFILE '.claude\usage-limits.json'
 $stateFile = Join-Path $env:USERPROFILE '.claude\usage-widget-pos.json'
@@ -24,7 +28,9 @@ if (-not $mutex.WaitOne(0)) { return }
      <ColumnDefinition Width="52"/><ColumnDefinition Width="120"/><ColumnDefinition Width="40"/><ColumnDefinition Width="Auto"/>
     </Grid.ColumnDefinitions>
     <TextBlock Grid.Column="0" Text="5 ч" Foreground="#F0EEE6" FontWeight="SemiBold" VerticalAlignment="Center"/>
-    <ProgressBar Grid.Column="1" x:Name="Bar5" Height="8" Maximum="100" Background="#33FFFFFF" BorderThickness="0" VerticalAlignment="Center"/>
+    <Border Grid.Column="1" Width="120" Height="4" CornerRadius="2" Background="#33257DE0" VerticalAlignment="Center" ClipToBounds="True">
+     <Border x:Name="Bar5" HorizontalAlignment="Left" Width="0" CornerRadius="2" Background="#257DE0"/>
+    </Border>
     <TextBlock Grid.Column="2" x:Name="Pct5" Text="—" Foreground="#F0EEE6" TextAlignment="Right" VerticalAlignment="Center"/>
     <TextBlock Grid.Column="3" x:Name="Rst5" Text="" Foreground="#9C9A92" Margin="8,0,0,0" VerticalAlignment="Center"/>
    </Grid>
@@ -33,7 +39,9 @@ if (-not $mutex.WaitOne(0)) { return }
      <ColumnDefinition Width="52"/><ColumnDefinition Width="120"/><ColumnDefinition Width="40"/><ColumnDefinition Width="Auto"/>
     </Grid.ColumnDefinitions>
     <TextBlock Grid.Column="0" Text="Неделя" Foreground="#F0EEE6" FontWeight="SemiBold" VerticalAlignment="Center"/>
-    <ProgressBar Grid.Column="1" x:Name="Bar7" Height="8" Maximum="100" Background="#33FFFFFF" BorderThickness="0" VerticalAlignment="Center"/>
+    <Border Grid.Column="1" Width="120" Height="4" CornerRadius="2" Background="#33257DE0" VerticalAlignment="Center" ClipToBounds="True">
+     <Border x:Name="Bar7" HorizontalAlignment="Left" Width="0" CornerRadius="2" Background="#257DE0"/>
+    </Border>
     <TextBlock Grid.Column="2" x:Name="Pct7" Text="—" Foreground="#F0EEE6" TextAlignment="Right" VerticalAlignment="Center"/>
     <TextBlock Grid.Column="3" x:Name="Rst7" Text="" Foreground="#9C9A92" Margin="8,0,0,0" VerticalAlignment="Center"/>
    </Grid>
@@ -64,10 +72,13 @@ $close.Add_Click({ $win.Close() })
 [void]$menu.Items.Add($close)
 $win.ContextMenu = $menu
 
-function Get-Brush([double]$pct) {
-  $hex = if ($pct -ge 90) { '#E5484D' } elseif ($pct -ge 70) { '#E2A336' } else { '#4CAF7A' }
-  (New-Object System.Windows.Media.BrushConverter).ConvertFromString($hex)
+# Colors of the meters on Claude's Settings > Usage page: accent blue, then warning and danger
+function Get-Fill([double]$pct) {
+  if ($pct -ge 95) { '#DC3C3D' } elseif ($pct -ge 80) { '#FBB315' } else { '#257DE0' }
 }
+
+$brushes = New-Object System.Windows.Media.BrushConverter
+function Get-Brush([string]$hex) { $brushes.ConvertFromString($hex) }
 
 function Format-Reset($resetsAt) {
   if (-not $resetsAt) { return '' }
@@ -82,10 +93,13 @@ function Format-Reset($resetsAt) {
 }
 
 function Set-Row($limit, $bar, $pct, $rst) {
-  if ($null -eq $limit) { $bar.Value = 0; $pct.Text = '—'; $rst.Text = ''; return }
+  if ($null -eq $limit) { $bar.Width = 0; $pct.Text = '—'; $rst.Text = ''; return }
   $v = [double]$limit.percentUsed
-  $bar.Value = [Math]::Min(100, $v)
-  $bar.Foreground = Get-Brush $v
+  # Like the page: never thinner than the bar is tall, so a small value still shows
+  $bar.Width = [Math]::Max(4, 120 * [Math]::Min(100, $v) / 100)
+  $fill = Get-Fill $v
+  $bar.Background = Get-Brush $fill
+  $bar.Parent.Background = Get-Brush ('#33' + $fill.Substring(1))
   $pct.Text = "$([int][Math]::Round($v))%"
   $rst.Text = Format-Reset $limit.resetsAt
 }
@@ -111,6 +125,18 @@ function Update-Widget {
   $ui.Note.Text = if ($mins -lt 1) { 'обновлено только что' } elseif ($mins -lt 60) { "обновлено $mins мин назад" } else { "обновлено $([int][Math]::Floor($mins / 60)) ч назад" }
 }
 
+# The taskbar puts itself above other topmost windows when clicked: take the top back every second.
+# HWND_TOPMOST = -1; SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE = 0x13
+$topTimer = New-Object System.Windows.Threading.DispatcherTimer
+$topTimer.Interval = [TimeSpan]::FromSeconds(1)
+$topTimer.Add_Tick({
+  if ($win.IsVisible) {
+    $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper $win).Handle
+    [void][ClaudeWidget.Native]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x13)
+  }
+})
+$topTimer.Start()
+
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(5)
 $timer.Add_Tick({ Update-Widget })
@@ -119,7 +145,7 @@ $timer.Start()
 # Keep the dispatcher running even while the window is hidden
 $app = New-Object System.Windows.Application
 $app.ShutdownMode = 'OnExplicitShutdown'
-$win.Add_Closed({ $timer.Stop(); $app.Shutdown() })
+$win.Add_Closed({ $timer.Stop(); $topTimer.Stop(); $app.Shutdown() })
 Update-Widget
 if (-not $win.IsVisible) { $win.Show(); if (-not (Test-ClaudeOpen)) { $win.Hide() } }
 [void]$app.Run()
